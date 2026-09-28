@@ -1,4 +1,4 @@
-name: AWS OIDC Smoke Test
+name: Manual ECR Image Push
 
 on:
   workflow_dispatch:
@@ -8,15 +8,94 @@ permissions:
   id-token: write
 
 jobs:
-  verify-aws-auth:
+  build-and-push:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install training dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -e .
+
+      - name: Verify dataset URL is configured
+        env:
+          TELCO_DATA_URL: ${{ vars.TELCO_DATA_URL }}
+        run: |
+          if [ -z "${TELCO_DATA_URL:-}" ]; then
+            echo "::error::Repository variable TELCO_DATA_URL is not configured."
+            exit 1
+          fi
+
+      - name: Download Telco dataset
+        env:
+          TELCO_DATA_URL: ${{ vars.TELCO_DATA_URL }}
+        run: |
+          mkdir -p notebook/data
+          curl --fail --location --show-error \
+            "$TELCO_DATA_URL" \
+            --output notebook/data/WA_Fn-UseC_-Telco-Customer-Churn.csv
+
+      - name: Validate Telco dataset
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          import pandas as pd
+
+          dataset_path = Path("notebook/data/WA_Fn-UseC_-Telco-Customer-Churn.csv")
+          if not dataset_path.is_file():
+              raise SystemExit("Dataset validation failed: downloaded CSV does not exist.")
+          if dataset_path.stat().st_size == 0:
+              raise SystemExit("Dataset validation failed: downloaded CSV is empty.")
+
+          try:
+              dataframe = pd.read_csv(dataset_path)
+          except Exception as error:
+              raise SystemExit(f"Dataset validation failed: pandas could not read the CSV: {error}")
+
+          if dataframe.empty:
+              raise SystemExit("Dataset validation failed: CSV contains no data rows.")
+          required_columns = {"Churn", "customerID", "TotalCharges"}
+          missing_columns = sorted(required_columns - set(dataframe.columns))
+          if missing_columns:
+              raise SystemExit(
+                  f"Dataset validation failed: missing required columns {missing_columns}."
+              )
+          print(f"Validated Telco dataset with {len(dataframe)} rows.")
+          PY
+
+      - name: Generate model artifacts
+        run: python -m src.pipeline.train_pipeline
+
+      - name: Verify model artifacts
+        run: |
+          test -s artifacts/model.pkl
+          test -s artifacts/preprocessor.pkl
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v6.3.0
         with:
           role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
 
-      - name: Verify AWS identity
-        run: aws sts get-caller-identity
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push SHA-tagged image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          IMAGE_URI="$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          docker build --tag "$IMAGE_URI" .
+          docker push "$IMAGE_URI"
+          echo "Pushed image with tag $IMAGE_TAG"
