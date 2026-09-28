@@ -1,7 +1,15 @@
-name: Manual ECR Image Push
+name: CD - Deploy to AWS
 
 on:
   workflow_dispatch:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+
+concurrency:
+  group: churnguard-production
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -10,10 +18,20 @@ permissions:
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_branch == 'main')
+    env:
+      DEPLOY_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ env.DEPLOY_SHA }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -93,7 +111,7 @@ jobs:
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
-          IMAGE_TAG: ${{ github.sha }}
+          IMAGE_TAG: ${{ env.DEPLOY_SHA }}
         run: |
           IMAGE_URI="$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
           docker build --tag "$IMAGE_URI" .
@@ -151,8 +169,8 @@ jobs:
           EC2_INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
           AWS_REGION: ${{ vars.AWS_REGION }}
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          IMAGE_URI: ${{ steps.login-ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:${{ github.sha }}
-          IMAGE_TAG: ${{ github.sha }}
+          IMAGE_URI: ${{ steps.login-ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:${{ env.DEPLOY_SHA }}
+          IMAGE_TAG: ${{ env.DEPLOY_SHA }}
         run: |
           PARAMETERS=$(python - <<'PY'
           import json
