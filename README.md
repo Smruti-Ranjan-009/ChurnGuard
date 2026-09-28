@@ -1,6 +1,6 @@
-# ChurnDeploy — ML Deployment with AWS CI/CD
+# ChurnGuard — Telco Customer Churn Prediction and AWS CI/CD
 
-ChurnDeploy predicts telecom customer churn from the IBM Telco Customer Churn dataset. The portfolio focus is the production path around a deliberately straightforward classifier: modular training, a Flask application, automated tests, containerization, and continuous integration.
+ChurnGuard predicts telecom customer churn from the IBM Telco Customer Churn dataset. The portfolio focus is the production path around a deliberately straightforward classifier: modular training, a Flask application, automated tests, containerization, and automated AWS deployment.
 
 ## Problem
 
@@ -29,31 +29,64 @@ Flask serves a customer form at `/`, accepts form or JSON input at `POST /predic
 
 These bands are product/demo thresholds, not statistically optimized or validated business decision thresholds.
 
-## Current Architecture
+## Architecture
 
 ```text
 Developer
-	↓
-GitHub
-	↓
-GitHub Actions
-	↓
-CI: Ruff + pytest + Docker health smoke test
-	↓
-Docker container
-	↓
-Flask + ML model
+↓
+GitHub main
+↓
+GitHub Actions CI
+├─ Ruff
+├─ Pytest
+├─ dataset validation
+├─ model training
+└─ Docker smoke test
+↓
+successful CI only
+↓
+GitHub Actions CD
+↓
+GitHub OIDC
+↓
+AWS IAM
+↓
+Amazon ECR
+↓
+AWS Systems Manager
+↓
+Amazon EC2
+↓
+Docker candidate container
+↓
+health validation
+↓
+production container
+↓
+public application
 ```
 
-CI is implemented in `.github/workflows/ci.yml`. Pull requests and pushes to `main` use Python 3.12, run lint and tests, download and validate the Telco CSV through the `TELCO_DATA_URL` repository variable, train the model artifacts, verify both artifacts, build Docker, and check container health. The Dropbox location is only a CI data-provisioning mechanism; its URL is not stored in this repository. AWS deployment is not implemented.
+CI runs on pull requests and pushes to `main`. It runs Ruff and pytest, downloads and validates the dataset, trains and verifies model artifacts, then builds Docker and runs a health smoke test. CD automatically runs only after successful CI triggered by a push to `main`; manual `workflow_dispatch` is available as a fallback.
 
 ## Technology Stack
 
-Current: Python, Pandas, Scikit-learn, XGBoost, Flask, Gunicorn, Pytest, Ruff, Docker, and GitHub Actions CI. Application logs are written to stdout/stderr in a format suitable for later collection by CloudWatch.
+Python, Pandas, Scikit-learn, XGBoost, Flask, Gunicorn, Pytest, Ruff, Docker, GitHub Actions, AWS IAM, GitHub OIDC, Amazon ECR, Amazon EC2, and AWS Systems Manager.
 
-## Planned Security Model
+## Deployment Security
 
-The planned AWS phase will use GitHub OIDC for short-lived AWS sessions and will not store permanent AWS access keys in GitHub. Its IAM trust policy should be restricted to this repository and the `main` ref, with least-privilege access to ECR and the target EC2 instance. No AWS credentials or deployment workflow are present in the repository.
+- GitHub Actions authenticates to AWS through GitHub OIDC and receives temporary AWS credentials; permanent AWS access keys are not stored in GitHub.
+- The IAM trust role is restricted to this repository and the `main` branch.
+- The GitHub deploy role has scoped ECR push and SSM permissions.
+- The EC2 instance role provides SSM and ECR image-read permissions.
+- Deployment uses Systems Manager; SSH is not used.
+
+## Image and Deployment Strategy
+
+Images are tagged with the immutable Git commit SHA that passed CI. Production deploys that SHA-tagged image, not `latest`; Amazon ECR stores the deployment images.
+
+The new image first runs as `churnguard-candidate`, bound only to `127.0.0.1:5001`. Production remains untouched until the candidate is healthy. After validation, the production container runs as `churnguard` with host port 80 mapped to container port 5000. Docker health checks and an EC2-local `/health` request verify the deployment.
+
+Before replacing an existing production container, it is preserved as `churnguard-rollback`. If the new production container fails health validation, it is removed and the previous container is restored and checked. The GitHub Actions job still fails even when rollback succeeds, making the failed release visible.
 
 ## Local Setup
 
@@ -74,11 +107,11 @@ The app listens on port 5000 by default; set `PORT` to override it. Training gen
 Train the model first, then build and run:
 
 ```powershell
-docker build -t churndeploy:local .
-docker run --detach --name churndeploy-local --publish 5000:5000 churndeploy:local
+docker build -t churnguard:local .
+docker run --detach --name churnguard-local --publish 5000:5000 churnguard:local
 Invoke-RestMethod http://localhost:5000/health
 Start-Process http://localhost:5000
-docker rm --force churndeploy-local
+docker rm --force churnguard-local
 ```
 
 The image runs Gunicorn as a non-root user and includes a Docker health check. Container logs go to stdout/stderr.
@@ -94,33 +127,22 @@ Tests cover ingestion, preprocessing with unknown categories, model artifacts/pr
 
 ## CI
 
-Pull requests and pushes to `main` run Ruff, pytest, Docker build, and a health-gated container smoke test. CI does not authenticate to AWS or deploy the application.
+Pull requests and pushes to `main` run CI: Ruff, pytest, dataset validation, model training, and a Docker health smoke test. CD runs automatically only after a successful CI run caused by a push to `main`; manual `workflow_dispatch` remains available as a fallback.
 
-## Planned AWS Deployment (Not Yet Implemented)
+## AWS Deployment
 
-The intended future architecture is:
-
-```text
-GitHub Actions
-→ GitHub OIDC
-→ AWS IAM
-→ Amazon ECR
-→ AWS Systems Manager
-→ EC2
-→ Docker
-→ /health
-```
-
-Before implementing this phase, create an ECR repository; an Ubuntu EC2 instance with Docker and SSM Agent; an EC2 instance profile with SSM and ECR pull permissions; the GitHub OIDC provider; and a GitHub IAM role restricted to this repository's `main` branch with ECR push and scoped SSM command permissions. Configure deployment values as GitHub variables, not committed credentials. Do not configure EC2 as a GitHub runner.
+CD uses GitHub OIDC for temporary AWS credentials, pushes the commit-SHA-tagged image to Amazon ECR, and uses Systems Manager to deploy it to Amazon EC2. Candidate and production health checks gate the deployment; an unhealthy production replacement triggers rollback to the preserved container. See [Image and Deployment Strategy](#image-and-deployment-strategy) for candidate and rollback behavior.
 
 ### ECR Image Retention
 
-When deployment is implemented, consider retaining the newest 5–10 SHA-tagged images. ECR lifecycle rules cannot dynamically inspect which digest EC2 is running. For a strict guarantee that active and rollback images are retained, use a cleanup process that checks those digests before deleting images; do not use a broad automatic expiration rule.
+Retain enough SHA-tagged ECR images for the desired rollback window. ECR lifecycle rules cannot dynamically inspect which digest EC2 is running; preserve the deployed and rollback images when applying expiration rules.
 
 ## Repository Structure
 
 ```text
-.github/workflows/   CI workflow only
+.github/workflows/
+	ci.yml              CI validation and Docker smoke test
+	deploy.yml          OIDC-based ECR push and SSM EC2 deployment
 artifacts/           fitted model and preprocessing artifacts
 notebook/data/       local source dataset (not included in the image)
 src/components/      ingestion, transformation, model training
