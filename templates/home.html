@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Predict Churn</title>
+</head>
+<body>
+    <main>
+        <h1>Telco customer details</h1>
+        <form action="{{ url_for('predict') }}" method="post">
+            <label>Gender<select name="gender" required><option>Female</option><option>Male</option></select></label>
+            <label>Senior citizen<select name="SeniorCitizen" required><option value="0">No</option><option value="1">Yes</option></select></label>
+            <label>Partner<select name="Partner" required><option>Yes</option><option>No</option></select></label>
+            <label>Dependents<select name="Dependents" required><option>Yes</option><option>No</option></select></label>
+            <label>Tenure (months)<input name="tenure" type="number" min="0" max="100" required></label>
+            <label>Phone service<select name="PhoneService" required><option>Yes</option><option>No</option></select></label>
+            <label>Multiple lines<select name="MultipleLines" required><option>No</option><option>Yes</option><option>No phone service</option></select></label>
+            <label>Internet service<select name="InternetService" required><option>DSL</option><option>Fiber optic</option><option>No</option></select></label>
+            {% for field in ["OnlineSecurity", "OnlineBackup", "DeviceProtection", "TechSupport", "StreamingTV", "StreamingMovies"] %}
+            <label>{{ field }}<select name="{{ field }}" required><option>No</option><option>Yes</option><option>No internet service</option></select></label>
+            {% endfor %}
+            <label>Contract<select name="Contract" required><option>Month-to-month</option><option>One year</option><option>Two year</option></select></label>
+            <label>Paperless billing<select name="PaperlessBilling" required><option>Yes</option><option>No</option></select></label>
+            <label>Payment method<select name="PaymentMethod" required><option>Electronic check</option><option>Mailed check</option><option>Bank transfer (automatic)</option><option>Credit card (automatic)</option></select></label>
+            <label>Monthly charges<input name="MonthlyCharges" type="number" min="0" step="0.01" required></label>
+            <label>Total charges<input name="TotalCharges" type="number" min="0" step="0.01"></label>
+            <button type="submit">Predict churn</button>
+        </form>
+        {% if error %}<p role="alert">{{ error }}</p>{% endif %}
+        {% if result %}
+        <section aria-live="polite">
+            <h2>Prediction: {{ "Churn" if result.prediction else "No churn" }}</h2>
+            <p>Estimated churn probability: {{ "%.1f"|format(result.churn_probability * 100) }}%</p>
+            <p>Risk level: {{ result.risk_level }}</p>
+        </section>
+        {% endif %}
+    </main>
+</body>
+</html>

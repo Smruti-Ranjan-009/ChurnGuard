@@ -1,0 +1,6 @@
+Flask>=3.0,<4.0
+gunicorn>=22.0,<24.0
+numpy>=1.26,<3.0
+pandas>=2.1,<4.0
+scikit-learn>=1.4,<2.0
+xgboost>=2.0,<4.0
