@@ -145,3 +145,188 @@ jobs:
 
           echo "SSM smoke test timed out while waiting for a terminal command status." >&2
           exit 1
+
+      - name: Deploy SHA-tagged image through SSM
+        env:
+          EC2_INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_URI: ${{ steps.login-ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:${{ github.sha }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          PARAMETERS=$(python - <<'PY'
+          import json
+          import os
+          import shlex
+
+          image_uri = shlex.quote(os.environ["IMAGE_URI"])
+          aws_region = shlex.quote(os.environ["AWS_REGION"])
+          registry = shlex.quote(os.environ["ECR_REGISTRY"])
+          image_tag = shlex.quote(os.environ["IMAGE_TAG"])
+          remote_script = f"""set -euo pipefail
+          IMAGE_URI={image_uri}
+          AWS_REGION={aws_region}
+          ECR_REGISTRY={registry}
+          IMAGE_TAG={image_tag}
+          CANDIDATE_NAME=churnguard-candidate
+          PRODUCTION_NAME=churnguard
+
+          sudo systemctl enable --now docker
+          aws ecr get-login-password --region "$AWS_REGION" | sudo docker login --username AWS --password-stdin "$ECR_REGISTRY"
+          sudo docker pull "$IMAGE_URI"
+
+          sudo docker rm -f "$CANDIDATE_NAME" >/dev/null 2>&1 || true
+          if ! sudo docker run --detach --restart no --name "$CANDIDATE_NAME" --publish 127.0.0.1:5001:5000 "$IMAGE_URI"; then
+            sudo docker logs "$CANDIDATE_NAME" || true
+            sudo docker rm -f "$CANDIDATE_NAME" || true
+            echo "Candidate failed to start; production container was not changed." >&2
+            exit 1
+          fi
+
+          wait_for_healthy() {{
+            local container_name="$1"
+            local attempt=0
+            local health_status
+            while [ "$attempt" -lt 60 ]; do
+              health_status=$(sudo docker inspect --format '{{{{.State.Health.Status}}}}' "$container_name" 2>/dev/null || true)
+              if [ "$health_status" = "healthy" ]; then
+                return 0
+              fi
+              if [ "$health_status" = "unhealthy" ]; then
+                return 1
+              fi
+              attempt=$((attempt + 1))
+              sleep 5
+            done
+            return 1
+          }}
+
+          if ! wait_for_healthy "$CANDIDATE_NAME"; then
+            sudo docker logs "$CANDIDATE_NAME" || true
+            sudo docker rm -f "$CANDIDATE_NAME" || true
+            echo "Candidate failed health validation; production container was not changed." >&2
+            exit 1
+          fi
+
+          sudo docker rm -f "$CANDIDATE_NAME"
+          ROLLBACK_NAME=churnguard-rollback
+          if sudo docker inspect "$PRODUCTION_NAME" >/dev/null 2>&1; then
+            sudo docker rm -f "$ROLLBACK_NAME" >/dev/null 2>&1 || true
+            sudo docker rename "$PRODUCTION_NAME" "$ROLLBACK_NAME"
+            if ! sudo docker stop "$ROLLBACK_NAME"; then
+              sudo docker rename "$ROLLBACK_NAME" "$PRODUCTION_NAME" || true
+              echo "Could not stop the previous production container; replacement was aborted." >&2
+              exit 1
+            fi
+          fi
+
+          rollback_production() {{
+            local failure_reason="$1"
+            local rollback_response
+            echo "$failure_reason" >&2
+            sudo docker logs "$PRODUCTION_NAME" || true
+            sudo docker rm -f "$PRODUCTION_NAME" || true
+
+            if ! sudo docker inspect "$ROLLBACK_NAME" >/dev/null 2>&1; then
+              echo "No previous production container was available for rollback." >&2
+              return 0
+            fi
+            if ! sudo docker rename "$ROLLBACK_NAME" "$PRODUCTION_NAME"; then
+              sudo docker logs "$ROLLBACK_NAME" || true
+              echo "Rollback failed: unable to restore the previous container name." >&2
+              return 0
+            fi
+            if ! sudo docker start "$PRODUCTION_NAME"; then
+              sudo docker logs "$PRODUCTION_NAME" || true
+              echo "Rollback failed: previous production container could not start." >&2
+              return 0
+            fi
+            if ! wait_for_healthy "$PRODUCTION_NAME"; then
+              sudo docker logs "$PRODUCTION_NAME" || true
+              echo "Rollback failed: previous production container did not become healthy." >&2
+              return 0
+            fi
+            if ! rollback_response=$(curl --fail --silent http://127.0.0.1/health); then
+              sudo docker logs "$PRODUCTION_NAME" || true
+              echo "Rollback failed: restored production /health request failed." >&2
+              return 0
+            fi
+            if [ "$rollback_response" != '{{"status":"healthy"}}' ]; then
+              sudo docker logs "$PRODUCTION_NAME" || true
+              echo "Rollback failed: restored production returned an unexpected /health response." >&2
+              return 0
+            fi
+            echo "Rollback succeeded"
+          }}
+
+          sudo docker rm -f "$PRODUCTION_NAME" || true
+          if ! sudo docker run --detach --restart unless-stopped --name "$PRODUCTION_NAME" --publish 80:5000 "$IMAGE_URI"; then
+            rollback_production "Production container failed to start."
+            exit 1
+          fi
+
+          if ! wait_for_healthy "$PRODUCTION_NAME"; then
+            rollback_production "Production container failed its Docker health check."
+            exit 1
+          fi
+
+          if ! HEALTH_RESPONSE=$(curl --fail --silent http://127.0.0.1/health); then
+            rollback_production "Production /health request failed."
+            exit 1
+          fi
+          if [ "$HEALTH_RESPONSE" != '{{"status":"healthy"}}' ]; then
+            echo "Unexpected /health response: $HEALTH_RESPONSE" >&2
+            rollback_production "Production returned an unexpected /health response."
+            exit 1
+          fi
+          if sudo docker inspect "$ROLLBACK_NAME" >/dev/null 2>&1; then
+            sudo docker rm -f "$ROLLBACK_NAME"
+          fi
+          echo "Deployment succeeded for image tag $IMAGE_TAG"
+          """
+          command = "bash -c " + shlex.quote(remote_script)
+          print(json.dumps({"commands": [command]}))
+          PY
+          )
+
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$EC2_INSTANCE_ID" \
+            --document-name AWS-RunShellScript \
+            --parameters "$PARAMETERS" \
+            --query 'Command.CommandId' \
+            --output text)
+          echo "Deployment SSM command ID: $COMMAND_ID"
+
+          ATTEMPT=0
+          MAX_ATTEMPTS=90
+          while [ "$ATTEMPT" -lt "$MAX_ATTEMPTS" ]; do
+            if INVOCATION=$(aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$EC2_INSTANCE_ID" \
+              --output json 2>&1); then
+              STATUS=$(printf '%s' "$INVOCATION" | python -c 'import json, sys; print(json.load(sys.stdin)["Status"])')
+              case "$STATUS" in
+                Success)
+                  echo "Deployment succeeded for image tag $IMAGE_TAG"
+                  exit 0
+                  ;;
+                Pending|InProgress|Delayed|Cancelling)
+                  ;;
+                *)
+                  printf '%s' "$INVOCATION" | python -c 'import json, sys; result=json.load(sys.stdin); print("StandardOutputContent:"); print(result.get("StandardOutputContent", "")); print("StandardErrorContent:"); print(result.get("StandardErrorContent", ""))'
+                  exit 1
+                  ;;
+              esac
+            elif [[ "$INVOCATION" == *InvocationDoesNotExist* ]]; then
+              echo "Deployment invocation not visible yet; retrying."
+            else
+              echo "$INVOCATION" >&2
+              exit 1
+            fi
+
+            ATTEMPT=$((ATTEMPT + 1))
+            sleep 5
+          done
+
+          echo "Deployment timed out while waiting for a terminal SSM command status." >&2
+          exit 1
